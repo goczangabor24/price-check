@@ -1,8 +1,10 @@
+import base64
 import io
 import json
 import re
 from typing import Dict, List, Tuple
 
+import fitz  # PyMuPDF
 import pandas as pd
 import pdfplumber
 import streamlit as st
@@ -47,20 +49,11 @@ def looks_numeric_column(column_name: str) -> bool:
         "net",
         "gross",
         "number",
-        "code",
-        "id",
     ]
     return any(keyword in name for keyword in numeric_keywords)
 
 
 def normalize_european_number(value: str) -> str:
-    """
-    Convert numeric-looking strings into European format:
-    1234.56 -> 1234,56
-    1,234.56 -> 1234,56
-    1.234,56 -> 1234,56
-    Keeps integers unchanged except cleanup.
-    """
     if value is None:
         return ""
 
@@ -69,40 +62,28 @@ def normalize_european_number(value: str) -> str:
         return ""
 
     s = s.replace("\u00a0", " ").strip()
-
-    # Remove currency text/symbols but keep digits, separators, minus
     s = re.sub(r"\bEUR\b", "", s, flags=re.IGNORECASE)
     s = s.replace("€", "").strip()
 
-    # If nothing numeric remains, return original stripped text
     if not re.search(r"\d", s):
         return s
 
-    # Remove spaces inside numbers
     s = s.replace(" ", "")
 
-    # Cases:
-    # 1) 1.234,56 -> decimal is comma, dots are thousand separators
     if "," in s and "." in s:
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "")
             s = s.replace(",", ".")
         else:
             s = s.replace(",", "")
-
-    # 2) only comma present
     elif "," in s:
-        # If exactly 1-2 digits after comma, treat as decimal comma
         parts = s.split(",")
         if len(parts) == 2 and len(parts[1]) in (1, 2, 3):
             s = s.replace(",", ".")
         else:
             s = s.replace(",", "")
-
-    # 3) only dot present
     elif "." in s:
         parts = s.split(".")
-        # If multiple dots and last part looks decimal, remove thousand separators
         if len(parts) > 2:
             decimal_part = parts[-1]
             int_part = "".join(parts[:-1])
@@ -110,11 +91,9 @@ def normalize_european_number(value: str) -> str:
                 s = f"{int_part}.{decimal_part}"
             else:
                 s = "".join(parts)
-        # Else leave as is
 
     try:
         num = float(s)
-        # Preserve decimals only when needed
         if num.is_integer():
             return str(int(num))
         formatted = f"{num:.2f}".rstrip("0").rstrip(".")
@@ -174,7 +153,23 @@ def extract_text_and_tables_from_pdf(file_bytes: bytes) -> Tuple[str, str]:
     return "\n".join(all_text), "\n".join(all_tables)
 
 
-def build_prompt(
+def render_pdf_pages_to_base64_png(file_bytes: bytes, max_pages: int = 8, zoom: float = 2.0) -> List[str]:
+    doc = fitz.open(stream=file_bytes, filetype="pdf")
+    images_base64 = []
+
+    page_count = min(len(doc), max_pages)
+    for i in range(page_count):
+        page = doc.load_page(i)
+        mat = fitz.Matrix(zoom, zoom)
+        pix = page.get_pixmap(matrix=mat, alpha=False)
+        img_bytes = pix.tobytes("png")
+        images_base64.append(base64.b64encode(img_bytes).decode("utf-8"))
+
+    doc.close()
+    return images_base64
+
+
+def build_text_prompt(
     columns: List[str],
     include_filename: bool,
     filename: str,
@@ -213,7 +208,72 @@ Extracted table preview:
 """.strip()
 
 
-def extract_rows_with_openai(
+def build_image_prompt(columns: List[str], include_filename: bool, filename: str) -> str:
+    columns_text = ", ".join(columns)
+
+    filename_instruction = (
+        f'Include a column called "source_file" with value "{filename}" in every row.'
+        if include_filename
+        else "Do not include any source filename unless it is one of the requested columns."
+    )
+
+    return f"""
+You are extracting structured row-based data from scanned PDF page images.
+
+Requested columns:
+{columns_text}
+
+Rules:
+1. Read the uploaded page images carefully.
+2. Return only rows that are actually visible in the document.
+3. Match the requested columns as closely as possible, even if the document uses slightly different labels.
+4. Do not invent values.
+5. If a value is missing for a row, return an empty string for that field.
+6. Return only JSON matching the required schema.
+7. Prices and amounts should be returned as plain numeric strings without currency symbols.
+8. For codes / IDs / article numbers, return only the relevant code value.
+9. {filename_instruction}
+""".strip()
+
+
+def build_schema(columns: List[str]) -> Dict:
+    return {
+        "type": "object",
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {col: {"type": "string"} for col in columns},
+                    "required": columns,
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["rows"],
+        "additionalProperties": False,
+    }
+
+
+def clean_rows(rows: List[Dict[str, str]], columns: List[str]) -> List[Dict[str, str]]:
+    cleaned_rows: List[Dict[str, str]] = []
+
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+
+        cleaned: Dict[str, str] = {}
+        for col in columns:
+            value = row.get(col, "")
+            cleaned[col] = sanitize_cell(value, looks_numeric_column(col))
+
+        if any(str(v).strip() for v in cleaned.values()):
+            cleaned_rows.append(cleaned)
+
+    return cleaned_rows
+
+
+def extract_rows_from_text_with_openai(
     client: OpenAI,
     model: str,
     columns: List[str],
@@ -226,24 +286,8 @@ def extract_rows_with_openai(
     if include_filename and "source_file" not in final_columns:
         final_columns = ["source_file"] + final_columns
 
-    prompt = build_prompt(final_columns, include_filename, filename, text, table_preview)
-
-    schema = {
-        "type": "object",
-        "properties": {
-            "rows": {
-                "type": "array",
-                "items": {
-                    "type": "object",
-                    "properties": {col: {"type": "string"} for col in final_columns},
-                    "required": final_columns,
-                    "additionalProperties": False,
-                },
-            }
-        },
-        "required": ["rows"],
-        "additionalProperties": False,
-    }
+    prompt = build_text_prompt(final_columns, include_filename, filename, text, table_preview)
+    schema = build_schema(final_columns)
 
     response = client.responses.create(
         model=model,
@@ -252,7 +296,7 @@ def extract_rows_with_openai(
         text={
             "format": {
                 "type": "json_schema",
-                "name": "pdf_rows",
+                "name": "pdf_rows_text",
                 "schema": schema,
                 "strict": True,
             }
@@ -260,9 +304,8 @@ def extract_rows_with_openai(
     )
 
     raw = (getattr(response, "output_text", "") or "").strip()
-
     if not raw:
-        raise ValueError("The model returned an empty response.")
+        raise ValueError("The model returned an empty response for text extraction.")
 
     data = json.loads(raw)
     rows = data.get("rows", [])
@@ -270,21 +313,55 @@ def extract_rows_with_openai(
     if not isinstance(rows, list):
         raise ValueError("The model response does not contain a valid 'rows' list.")
 
-    cleaned_rows: List[Dict[str, str]] = []
+    return clean_rows(rows, final_columns)
 
-    for row in rows:
-        if not isinstance(row, dict):
-            continue
 
-        cleaned: Dict[str, str] = {}
-        for col in final_columns:
-            value = row.get(col, "")
-            cleaned[col] = sanitize_cell(value, looks_numeric_column(col))
+def extract_rows_from_images_with_openai(
+    client: OpenAI,
+    model: str,
+    columns: List[str],
+    include_filename: bool,
+    filename: str,
+    images_base64: List[str]
+) -> List[Dict[str, str]]:
+    final_columns = columns[:]
+    if include_filename and "source_file" not in final_columns:
+        final_columns = ["source_file"] + final_columns
 
-        if any(str(v).strip() for v in cleaned.values()):
-            cleaned_rows.append(cleaned)
+    schema = build_schema(final_columns)
+    prompt = build_image_prompt(final_columns, include_filename, filename)
 
-    return cleaned_rows
+    content = [{"type": "input_text", "text": prompt}]
+    for img_b64 in images_base64:
+        content.append({
+            "type": "input_image",
+            "image_url": f"data:image/png;base64,{img_b64}"
+        })
+
+    response = client.responses.create(
+        model=model,
+        input=[{"role": "user", "content": content}],
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "pdf_rows_image",
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    )
+
+    raw = (getattr(response, "output_text", "") or "").strip()
+    if not raw:
+        raise ValueError("The model returned an empty response for image extraction.")
+
+    data = json.loads(raw)
+    rows = data.get("rows", [])
+
+    if not isinstance(rows, list):
+        raise ValueError("The model response does not contain a valid 'rows' list.")
+
+    return clean_rows(rows, final_columns)
 
 
 def dataframe_to_tsv(df: pd.DataFrame) -> str:
@@ -306,6 +383,7 @@ with st.sidebar:
     api_key = get_api_key()
     model = st.text_input("Model", value="gpt-4.1-mini")
     include_filename = st.checkbox("Include source filename column", value=True)
+    max_pages = st.number_input("Max pages for scanned PDF fallback", min_value=1, max_value=20, value=8)
 
 st.markdown("### 1. Upload PDF files")
 uploaded_files = st.file_uploader(
@@ -349,26 +427,31 @@ if run:
             file_bytes = uploaded_file.read()
             text, table_preview = extract_text_and_tables_from_pdf(file_bytes)
 
-            if not text.strip() and not table_preview.strip():
-                raise ValueError(
-                    "No readable text or tables could be extracted from this PDF. "
-                    "It may be a scanned image PDF."
+            if text.strip() or table_preview.strip():
+                rows = extract_rows_from_text_with_openai(
+                    client=client,
+                    model=model,
+                    columns=columns,
+                    include_filename=include_filename,
+                    filename=uploaded_file.name,
+                    text=text,
+                    table_preview=table_preview,
                 )
+            else:
+                st.info(f"{uploaded_file.name}: No readable text layer found. Switching to image-based extraction.")
+                images_base64 = render_pdf_pages_to_base64_png(file_bytes, max_pages=max_pages)
 
-            rows = extract_rows_with_openai(
-                client=client,
-                model=model,
-                columns=columns,
-                include_filename=include_filename,
-                filename=uploaded_file.name,
-                text=text,
-                table_preview=table_preview,
-            )
+                rows = extract_rows_from_images_with_openai(
+                    client=client,
+                    model=model,
+                    columns=columns,
+                    include_filename=include_filename,
+                    filename=uploaded_file.name,
+                    images_base64=images_base64,
+                )
 
             if not rows:
-                st.warning(
-                    f"{uploaded_file.name}: No rows could be extracted for the requested columns."
-                )
+                st.warning(f"{uploaded_file.name}: No rows could be extracted for the requested columns.")
             else:
                 all_rows.extend(rows)
                 st.success(f"{uploaded_file.name}: Extracted {len(rows)} row(s).")
@@ -383,7 +466,6 @@ if run:
     if all_rows:
         df = pd.DataFrame(all_rows)
 
-        # Keep column order stable
         desired_columns = columns[:]
         if include_filename:
             desired_columns = ["source_file"] + desired_columns
