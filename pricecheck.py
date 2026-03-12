@@ -1,14 +1,21 @@
 import streamlit as st
 import google.generativeai as genai
-import time
 
-# --- CONFIGURATION ---
+# --- API KULCS TISZTÍTÁSA ÉS BETÖLTÉSE ---
+raw_key = ""
 try:
-    api_key = st.secrets["GOOGLE_API_KEY"]
+    if "GOOGLE_API_KEY" in st.secrets:
+        raw_key = st.secrets["GOOGLE_API_KEY"]
+    else:
+        st.error("Missing API Key in Secrets!")
 except:
-    api_key = "YOUR_LOCAL_API_KEY_HERE"
+    raw_key = "YOUR_LOCAL_KEY"
 
-genai.configure(api_key=api_key)
+# Eltávolítja az esetleges szóközöket vagy idézőjeleket, amik a hibát okozzák
+api_key = raw_key.strip().strip('"').strip("'")
+
+if api_key:
+    genai.configure(api_key=api_key)
 
 st.set_page_config(page_title="Invoice Extractor", layout="wide")
 st.title("📄 Universal Invoice Data Extractor")
@@ -17,56 +24,42 @@ with st.sidebar:
     st.header("Settings")
     columns_needed = st.text_input("Columns to extract:", "ArtNr, Preis")
     decimal_sep = st.selectbox("Decimal separator:", [",", "."])
-    show_debug = st.checkbox("Show technical details (Debug)")
 
 uploaded_file = st.file_uploader("Upload Invoice (PDF)", type=["pdf"])
 
-if uploaded_file:
+if uploaded_file and api_key:
     if st.button("Extract Data"):
-        status_container = st.empty()
-        status_container.info("Initializing Gemini AI...")
+        # Egy üres helyfoglaló a státuszüzeneteknek
+        status = st.empty()
+        status.info("Connecting to Google AI...")
         
         try:
             model = genai.GenerativeModel('gemini-1.5-flash')
-            pdf_data = uploaded_file.read()
+            pdf_parts = [
+                {
+                    "mime_type": "application/pdf",
+                    "data": uploaded_file.getvalue()
+                }
+            ]
             
             prompt = f"""
-            Analyze the uploaded invoice and extract these columns: {columns_needed}.
+            Extract these columns: {columns_needed}.
             Format: Tab-Separated Values (TSV). Use '{decimal_sep}' for decimals.
-            Provide ONLY raw data rows, no headers, no conversational text.
+            Return ONLY raw rows. No headers, no markdown blocks.
             """
             
-            status_container.info("Sending file to Google servers... (this may take 10-20 seconds)")
+            status.info("Analyzing document... (this can take 15-30 seconds)")
+            response = model.generate_content([prompt, pdf_parts[0]])
             
-            # Időmérés a biztonság kedvéért
-            start_time = time.time()
-            
-            response = model.generate_content([
-                prompt,
-                {"mime_type": "application/pdf", "data": pdf_data}
-            ])
-            
-            end_time = time.time()
-            
-            if show_debug:
-                st.write(f"Response time: {end_time - start_time:.2f} seconds")
-
-            # Válasz tisztítása
-            result_text = response.text.strip().replace("```", "").replace("tsv", "")
-
-            if result_text:
-                status_container.success("Extraction complete!")
-                st.subheader("Extracted Results")
-                st.text_area("Raw Data (Copyable):", result_text, height=300)
-                
-                st.download_button(
-                    label="Download Results",
-                    data=result_text,
-                    file_name="invoice_data.txt"
-                )
+            # Válasz megjelenítése
+            if response.text:
+                status.success("Done!")
+                clean_text = response.text.strip().replace("```", "").replace("tsv", "")
+                st.text_area("Results:", clean_text, height=400)
+                st.download_button("Download TSV", clean_text, file_name="invoice.txt")
             else:
-                status_container.error("The AI returned an empty response. Try more specific column names.")
+                status.error("AI returned empty result.")
                 
         except Exception as e:
-            status_container.error(f"An error occurred during processing.")
-            st.exception(e) # Ez kiírja a pontos hibaüzenetet
+            status.error(f"API Error: {str(e)}")
+            st.warning("Tip: Check if your API key has leading/trailing spaces in Streamlit Secrets.")
