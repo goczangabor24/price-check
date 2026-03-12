@@ -1,7 +1,7 @@
 import io
 import json
 import re
-from typing import Any, Dict, List
+from typing import Dict, List, Tuple
 
 import pandas as pd
 import pdfplumber
@@ -9,295 +9,404 @@ import streamlit as st
 from openai import OpenAI
 
 
-st.set_page_config(page_title="PDF → TSV extractor", page_icon="📄", layout="wide")
+st.set_page_config(page_title="PDF Column Extractor", page_icon="📄", layout="wide")
 
+
+# ---------------------------
+# Helpers
+# ---------------------------
 
 def get_api_key() -> str:
+    key = ""
     try:
-        if "OPENAI_API_KEY" in st.secrets:
-            return st.secrets["OPENAI_API_KEY"]
+        key = st.secrets.get("OPENAI_API_KEY", "")
     except Exception:
-        pass
-    return st.session_state.get("manual_api_key", "")
+        key = ""
 
+    sidebar_key = st.sidebar.text_input("OpenAI API key", type="password")
+    if sidebar_key.strip():
+        key = sidebar_key.strip()
 
-@st.cache_data(show_spinner=False)
-def extract_text_from_pdf_bytes(file_bytes: bytes) -> str:
-    parts: List[str] = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for i, page in enumerate(pdf.pages, start=1):
-            text = page.extract_text() or ""
-            parts.append(f"\n--- PAGE {i} ---\n{text}")
-    return "\n".join(parts).strip()
-
-
-@st.cache_data(show_spinner=False)
-def try_extract_tables_preview(file_bytes: bytes) -> str:
-    snippets: List[str] = []
-    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
-        for i, page in enumerate(pdf.pages[:3], start=1):
-            try:
-                tables = page.extract_tables() or []
-                for t_idx, table in enumerate(tables[:2], start=1):
-                    rows = []
-                    for row in table[:8]:
-                        cleaned = ["" if c is None else str(c) for c in row]
-                        rows.append(" | ".join(cleaned))
-                    if rows:
-                        snippets.append(f"\n[PAGE {i} - TABLE {t_idx}]\n" + "\n".join(rows))
-            except Exception:
-                continue
-    return "\n".join(snippets).strip()
-
-
-NUMBER_HINTS = {
-    "price", "preis", "unit price", "amount", "betrag", "summe", "total",
-    "eur", "euro", "net", "netto", "gross", "brutto", "vat", "mwst",
-    "tax", "qty", "quantity", "anzahl", "value", "wert", "cost", "kosten"
-}
+    return key
 
 
 def looks_numeric_column(column_name: str) -> bool:
-    name = column_name.lower().strip()
-    return any(hint in name for hint in NUMBER_HINTS)
+    name = column_name.strip().lower()
+    numeric_keywords = [
+        "price",
+        "amount",
+        "unit price",
+        "total",
+        "sum",
+        "qty",
+        "quantity",
+        "cost",
+        "value",
+        "vat",
+        "eur",
+        "net",
+        "gross",
+        "number",
+        "code",
+        "id",
+    ]
+    return any(keyword in name for keyword in numeric_keywords)
 
 
-
-def normalize_eu_number(value: Any) -> str:
+def normalize_european_number(value: str) -> str:
+    """
+    Convert numeric-looking strings into European format:
+    1234.56 -> 1234,56
+    1,234.56 -> 1234,56
+    1.234,56 -> 1234,56
+    Keeps integers unchanged except cleanup.
+    """
     if value is None:
         return ""
+
     s = str(value).strip()
     if not s:
         return ""
 
-    s = s.replace("\u00a0", " ").replace(" ", "")
-    s = re.sub(r"[^0-9,.-]", "", s)
-    if not s:
-        return ""
+    s = s.replace("\u00a0", " ").strip()
 
-    # Keep leading minus only.
-    negative = s.startswith("-")
-    s = s.replace("-", "")
+    # Remove currency text/symbols but keep digits, separators, minus
+    s = re.sub(r"\bEUR\b", "", s, flags=re.IGNORECASE)
+    s = s.replace("€", "").strip()
 
+    # If nothing numeric remains, return original stripped text
+    if not re.search(r"\d", s):
+        return s
+
+    # Remove spaces inside numbers
+    s = s.replace(" ", "")
+
+    # Cases:
+    # 1) 1.234,56 -> decimal is comma, dots are thousand separators
     if "," in s and "." in s:
-        # Last separator is assumed to be the decimal separator.
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "")
+            s = s.replace(",", ".")
         else:
             s = s.replace(",", "")
-    elif s.count(",") > 1 and "." not in s:
-        s = s.replace(",", "")
-    elif s.count(".") > 1 and "," not in s:
-        s = s.replace(".", "")
 
-    if "." in s and "," not in s:
-        s = s.replace(".", ",")
+    # 2) only comma present
+    elif "," in s:
+        # If exactly 1-2 digits after comma, treat as decimal comma
+        parts = s.split(",")
+        if len(parts) == 2 and len(parts[1]) in (1, 2, 3):
+            s = s.replace(",", ".")
+        else:
+            s = s.replace(",", "")
 
-    if negative and s:
-        s = "-" + s
-    return s
+    # 3) only dot present
+    elif "." in s:
+        parts = s.split(".")
+        # If multiple dots and last part looks decimal, remove thousand separators
+        if len(parts) > 2:
+            decimal_part = parts[-1]
+            int_part = "".join(parts[:-1])
+            if len(decimal_part) in (1, 2, 3):
+                s = f"{int_part}.{decimal_part}"
+            else:
+                s = "".join(parts)
+        # Else leave as is
+
+    try:
+        num = float(s)
+        # Preserve decimals only when needed
+        if num.is_integer():
+            return str(int(num))
+        formatted = f"{num:.2f}".rstrip("0").rstrip(".")
+        return formatted.replace(".", ",")
+    except Exception:
+        return str(value).strip()
 
 
-
-def sanitize_cell(value: Any, numeric: bool) -> str:
+def sanitize_cell(value: str, numeric: bool) -> str:
     if value is None:
         return ""
-    s = str(value).strip()
+    text = str(value).strip()
+
+    if not text:
+        return ""
+
     if numeric:
-        return normalize_eu_number(s)
-    return re.sub(r"\s+", " ", s)
+        return normalize_european_number(text)
+
+    return re.sub(r"\s+", " ", text).strip()
 
 
+def extract_text_and_tables_from_pdf(file_bytes: bytes) -> Tuple[str, str]:
+    all_text: List[str] = []
+    all_tables: List[str] = []
 
-def build_prompt(columns: List[str], include_filename: bool, filename: str, text: str, table_preview: str) -> str:
-    col_block = "\n".join(f"- {c}" for c in columns)
-    numeric_cols = [c for c in columns if looks_numeric_column(c)]
-    numeric_block = "\n".join(f"- {c}" for c in numeric_cols) if numeric_cols else "- none"
+    with pdfplumber.open(io.BytesIO(file_bytes)) as pdf:
+        for page_num, page in enumerate(pdf.pages, start=1):
+            page_text = page.extract_text() or ""
+            if page_text.strip():
+                all_text.append(f"\n--- PAGE {page_num} ---\n{page_text}")
+
+            try:
+                tables = page.extract_tables() or []
+            except Exception:
+                tables = []
+
+            for table_idx, table in enumerate(tables, start=1):
+                if not table:
+                    continue
+
+                cleaned_rows = []
+                for row in table:
+                    if not row:
+                        continue
+                    cleaned = [
+                        re.sub(r"\s+", " ", str(cell).strip()) if cell is not None else ""
+                        for cell in row
+                    ]
+                    cleaned_rows.append(" | ".join(cleaned))
+
+                if cleaned_rows:
+                    all_tables.append(
+                        f"\n--- PAGE {page_num} TABLE {table_idx} ---\n" + "\n".join(cleaned_rows)
+                    )
+
+    return "\n".join(all_text), "\n".join(all_tables)
+
+
+def build_prompt(
+    columns: List[str],
+    include_filename: bool,
+    filename: str,
+    text: str,
+    table_preview: str
+) -> str:
+    columns_text = ", ".join(columns)
+
+    filename_instruction = (
+        f'Include a column called "source_file" with value "{filename}" in every row.'
+        if include_filename
+        else "Do not include any source filename unless it is one of the requested columns."
+    )
 
     return f"""
-You extract structured data from PDF text.
+You are extracting structured row-based data from a PDF.
 
-Task:
-Return ONLY valid JSON with this exact shape:
-{{
-  "rows": [
-    {{{', '.join(f'"{c}": ""' for c in columns)}}}
-  ]
-}}
+Requested columns:
+{columns_text}
 
 Rules:
-1. Extract values only from the requested columns.
-2. Each row must represent one logical line item from the PDF.
+1. Return only rows that you can infer from the PDF content.
+2. Match the requested columns as closely as possible, even if the PDF uses slightly different labels.
 3. Do not invent values.
-4. If a value is missing, use an empty string.
-5. Keep codes/article numbers/item IDs exactly as seen.
-6. For numeric-looking fields, return only the numeric text, without currency symbols.
-7. Ignore summary/footer rows unless they clearly belong to the requested columns.
-8. Output JSON only. No markdown. No explanation.
-9. Requested columns are exactly:
-{col_block}
+4. If a value is missing for a row, return an empty string for that field.
+5. Return only JSON matching the required schema.
+6. Prices and amounts should be returned as plain numeric strings without currency symbols.
+7. For codes / IDs / article numbers, return only the relevant code value.
+8. {filename_instruction}
 
-Numeric columns to treat as numbers:
-{numeric_block}
+PDF text:
+{text[:25000]}
 
-Current file name: {filename if include_filename else 'not needed in output'}
-
-PDF table preview (best-effort):
-{table_preview[:12000]}
-
-Full extracted PDF text:
-{text[:120000]}
+Extracted table preview:
+{table_preview[:20000]}
 """.strip()
 
 
+def extract_rows_with_openai(
+    client: OpenAI,
+    model: str,
+    columns: List[str],
+    include_filename: bool,
+    filename: str,
+    text: str,
+    table_preview: str
+) -> List[Dict[str, str]]:
+    final_columns = columns[:]
+    if include_filename and "source_file" not in final_columns:
+        final_columns = ["source_file"] + final_columns
 
-def extract_rows_with_openai(client: OpenAI, model: str, columns: List[str], include_filename: bool, filename: str, text: str, table_preview: str) -> List[Dict[str, str]]:
-    prompt = build_prompt(columns, include_filename, filename, text, table_preview)
-    response = client.chat.completions.create(
-    model="gpt-5-mini",
-    messages=[
-        {"role": "system", "content": "You extract structured data from invoices."},
-        {"role": "user", "content": prompt}
-    ]
-)
-    raw = getattr(response, "output_text", "") or ""
-    raw = raw.strip()
+    prompt = build_prompt(final_columns, include_filename, filename, text, table_preview)
 
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?", "", raw).strip()
-        raw = re.sub(r"```$", "", raw).strip()
+    schema = {
+        "type": "object",
+        "properties": {
+            "rows": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {col: {"type": "string"} for col in final_columns},
+                    "required": final_columns,
+                    "additionalProperties": False,
+                },
+            }
+        },
+        "required": ["rows"],
+        "additionalProperties": False,
+    }
+
+    response = client.responses.create(
+        model=model,
+        instructions="You extract structured data from PDF text and return only valid JSON.",
+        input=prompt,
+        text={
+            "format": {
+                "type": "json_schema",
+                "name": "pdf_rows",
+                "schema": schema,
+                "strict": True,
+            }
+        },
+    )
+
+    raw = (getattr(response, "output_text", "") or "").strip()
+
+    if not raw:
+        raise ValueError("The model returned an empty response.")
 
     data = json.loads(raw)
     rows = data.get("rows", [])
+
     if not isinstance(rows, list):
-        raise ValueError("The model response did not contain a rows list.")
+        raise ValueError("The model response does not contain a valid 'rows' list.")
 
     cleaned_rows: List[Dict[str, str]] = []
+
     for row in rows:
         if not isinstance(row, dict):
             continue
+
         cleaned: Dict[str, str] = {}
-        for col in columns:
-            cleaned[col] = sanitize_cell(row.get(col, ""), looks_numeric_column(col))
+        for col in final_columns:
+            value = row.get(col, "")
+            cleaned[col] = sanitize_cell(value, looks_numeric_column(col))
+
         if any(str(v).strip() for v in cleaned.values()):
             cleaned_rows.append(cleaned)
+
     return cleaned_rows
 
 
-
 def dataframe_to_tsv(df: pd.DataFrame) -> str:
-    df = df.fillna("")
-    return df.to_csv(sep="\t", index=False, lineterminator="\n")
+    return df.to_csv(sep="\t", index=False)
 
 
-st.title("📄 PDF → TSV extractor")
-st.caption("Tölts fel egy vagy több PDF-et, add meg a kívánt oszlopneveket, és az app tab-separated kimenetet ad vissza. A numerikus mezőket európai formára alakítja (tizedesvessző).")
+# ---------------------------
+# UI
+# ---------------------------
+
+st.title("PDF Column Extractor to TSV")
+st.write(
+    "Upload one or more PDF files, specify the columns you want to extract, "
+    "and get a tab-separated output with European decimal formatting."
+)
 
 with st.sidebar:
-    st.header("Beállítások")
-    st.text_input(
-        "OpenAI API key",
-        type="password",
-        key="manual_api_key",
-        help="Ha Streamlit secrets-ben már benne van, itt nem kell megadni.",
-    )
-    model = st.text_input("Model", value="gpt-5-mini")
-    include_filename = st.checkbox("Legyen külön source_file oszlop", value=True)
-    st.markdown("A deployolt appnál ajánlott a kulcsot `OPENAI_API_KEY` néven a Streamlit Secrets-be tenni.")
+    st.header("Settings")
+    api_key = get_api_key()
+    model = st.text_input("Model", value="gpt-4.1-mini")
+    include_filename = st.checkbox("Include source filename column", value=True)
 
+st.markdown("### 1. Upload PDF files")
 uploaded_files = st.file_uploader(
-    "PDF-ek feltöltése",
+    "Choose PDF files",
     type=["pdf"],
     accept_multiple_files=True,
 )
 
-columns_text = st.text_area(
-    "Kért oszlopok",
-    value="item_code\nunit_price_wo_vat",
-    height=160,
-    help="Soronként egy oszlopnév. Példa: item_code, unit_price_wo_vat, amount, customer_id",
+st.markdown("### 2. Enter the columns to extract")
+columns_input = st.text_area(
+    "One column per line",
+    value="item code\nunit price w/o VAT",
+    height=120,
 )
 
-run = st.button("Kivonatolás indítása", type="primary")
+run = st.button("Extract data", type="primary")
 
 if run:
-    api_key = get_api_key()
     if not api_key:
-        st.error("Adj meg OpenAI API key-t a sidebarban, vagy tedd be a Streamlit Secrets-be `OPENAI_API_KEY` néven.")
+        st.error("Please provide your OpenAI API key in the sidebar or in Streamlit secrets.")
         st.stop()
 
     if not uploaded_files:
-        st.error("Tölts fel legalább egy PDF-et.")
+        st.error("Please upload at least one PDF file.")
         st.stop()
 
-    requested_columns = [c.strip() for c in columns_text.splitlines() if c.strip()]
-    if include_filename and "source_file" not in requested_columns:
-        columns = ["source_file"] + requested_columns
-    else:
-        columns = requested_columns
-
+    columns = [line.strip() for line in columns_input.splitlines() if line.strip()]
     if not columns:
-        st.error("Adj meg legalább egy oszlopnevet.")
+        st.error("Please provide at least one column name.")
         st.stop()
 
     client = OpenAI(api_key=api_key)
     all_rows: List[Dict[str, str]] = []
-    errors: List[str] = []
-
     progress = st.progress(0)
     status = st.empty()
 
-    for idx, uploaded in enumerate(uploaded_files, start=1):
-        status.write(f"Feldolgozás: {uploaded.name} ({idx}/{len(uploaded_files)})")
+    for idx, uploaded_file in enumerate(uploaded_files, start=1):
         try:
-            file_bytes = uploaded.read()
-            text = extract_text_from_pdf_bytes(file_bytes)
-            table_preview = try_extract_tables_preview(file_bytes)
-            row_columns = [c for c in columns if c != "source_file"]
+            status.write(f"Processing: **{uploaded_file.name}**")
+
+            file_bytes = uploaded_file.read()
+            text, table_preview = extract_text_and_tables_from_pdf(file_bytes)
+
+            if not text.strip() and not table_preview.strip():
+                raise ValueError(
+                    "No readable text or tables could be extracted from this PDF. "
+                    "It may be a scanned image PDF."
+                )
+
             rows = extract_rows_with_openai(
                 client=client,
                 model=model,
-                columns=row_columns,
+                columns=columns,
                 include_filename=include_filename,
-                filename=uploaded.name,
+                filename=uploaded_file.name,
                 text=text,
                 table_preview=table_preview,
             )
-            if include_filename:
-                for row in rows:
-                    row["source_file"] = uploaded.name
-            all_rows.extend(rows)
+
+            if not rows:
+                st.warning(
+                    f"{uploaded_file.name}: No rows could be extracted for the requested columns."
+                )
+            else:
+                all_rows.extend(rows)
+                st.success(f"{uploaded_file.name}: Extracted {len(rows)} row(s).")
+
         except Exception as e:
-            errors.append(f"{uploaded.name}: {e}")
+            st.error(f"{uploaded_file.name}: {str(e)}")
+
         progress.progress(idx / len(uploaded_files))
 
     status.empty()
 
-    if errors:
-        with st.expander("Hibák", expanded=True):
-            for err in errors:
-                st.error(err)
+    if all_rows:
+        df = pd.DataFrame(all_rows)
 
-    if not all_rows:
-        st.warning("Nem sikerült kinyerni sorokat a megadott oszlopokhoz.")
-        st.stop()
+        # Keep column order stable
+        desired_columns = columns[:]
+        if include_filename:
+            desired_columns = ["source_file"] + desired_columns
 
-    df = pd.DataFrame(all_rows)
-    ordered_cols = [c for c in columns if c in df.columns] + [c for c in df.columns if c not in columns]
-    df = df[ordered_cols]
+        for col in desired_columns:
+            if col not in df.columns:
+                df[col] = ""
 
-    for col in df.columns:
-        if looks_numeric_column(col):
-            df[col] = df[col].map(lambda x: normalize_eu_number(x) if str(x).strip() else "")
+        df = df[desired_columns]
 
-    st.success(f"Kész. {len(df)} sor került kinyerésre.")
-    st.dataframe(df, use_container_width=True)
+        st.markdown("### 3. Preview")
+        st.dataframe(df, use_container_width=True)
 
-    tsv_text = dataframe_to_tsv(df)
-    st.text_area("TSV kimenet", value=tsv_text, height=260)
-    st.download_button(
-        "TSV letöltése",
-        data=tsv_text.encode("utf-8"),
-        file_name="extracted.tsv",
-        mime="text/tab-separated-values",
-    )
+        tsv_output = dataframe_to_tsv(df)
+
+        st.markdown("### 4. TSV output")
+        st.text_area("Copy this tab-separated output", value=tsv_output, height=300)
+
+        st.download_button(
+            label="Download TSV",
+            data=tsv_output.encode("utf-8"),
+            file_name="extracted_data.tsv",
+            mime="text/tab-separated-values",
+        )
+    else:
+        st.warning("No extractable rows were found in the uploaded files.")
