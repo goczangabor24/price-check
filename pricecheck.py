@@ -1,65 +1,63 @@
 import streamlit as st
-import requests
+from openai import OpenAI
 import base64
 
-# --- API KULCS TISZTÍTÁSA ---
+# --- API KULCS KEZELÉSE ---
 api_key = ""
-if "GOOGLE_API_KEY" in st.secrets:
-    api_key = st.secrets["GOOGLE_API_KEY"].strip().replace('"', '').replace("'", "")
+if "OPENAI_API_KEY" in st.secrets:
+    api_key = st.secrets["OPENAI_API_KEY"].strip()
 
-st.set_page_config(page_title="Invoice Extractor", layout="wide")
-st.title("📄 Smart Invoice Extractor")
+st.set_page_config(page_title="Invoice Extractor (ChatGPT)", layout="wide")
+st.title("📄 ChatGPT Invoice Data Extractor")
 
 with st.sidebar:
     st.header("Settings")
-    # Kipróbáljuk az összes lehetséges variációt
-    model_options = [
-        "gemini-1.5-flash-latest", 
-        "gemini-1.5-flash", 
-        "gemini-1.5-pro-latest",
-        "gemini-1.5-flash-001"
-    ]
-    model_name = st.selectbox("Select Model Variant:", model_options)
-    columns_needed = st.text_input("Columns:", "ArtNr, Preis")
+    # A gpt-4o a legjobb a dokumentumokhoz
+    model_name = st.selectbox("Model:", ["gpt-4o", "gpt-4o-mini"])
+    columns_needed = st.text_input("Columns to extract:", "ArtNr, Preis")
 
 uploaded_file = st.file_uploader("Upload Invoice (PDF)", type=["pdf"])
 
 if uploaded_file and api_key:
     if st.button("Extract Data"):
         status = st.empty()
+        status.info("Connecting to OpenAI...")
         
         try:
+            client = OpenAI(api_key=api_key)
+            
+            # PDF átalakítása Base64-be
             pdf_base64 = base64.b64encode(uploaded_file.read()).decode('utf-8')
             
-            # Próbálkozunk a v1beta végponttal (ez a legvalószínűbb a PDF-hez)
-            url = f"https://generativelanguage.googleapis.com/v1beta/models/{model_name}:generateContent?key={api_key}"
+            # ChatGPT kérés összeállítása
+            response = client.chat.completions.create(
+                model=model_name,
+                messages=[
+                    {
+                        "role": "user",
+                        "content": [
+                            {"type": "text", "text": f"Extract these columns as TSV data: {columns_needed}. No headers, no talk."},
+                            {
+                                "type": "input_file",
+                                "input_file": {
+                                    "data": pdf_base64,
+                                    "format": "pdf"
+                                }
+                            }
+                        ],
+                    }
+                ],
+            )
             
-            status.info(f"Trying model: {model_name}...")
+            result = response.choices[0].message.content
             
-            payload = {
-                "contents": [{
-                    "parts": [
-                        {"text": f"Extract {columns_needed} from this invoice as TSV rows. No headers."},
-                        {"inline_data": {"mime_type": "application/pdf", "data": pdf_base64}}
-                    ]
-                }]
-            }
-
-            response = requests.post(url, json=payload)
+            status.success("Done!")
+            clean_output = result.replace("```tsv", "").replace("```", "").strip()
+            st.text_area("Results:", clean_output, height=400)
+            st.download_button("Download", clean_output, file_name="invoice_data.txt")
             
-            if response.status_code == 200:
-                res_data = response.json()
-                text = res_data['candidates'][0]['content']['parts'][0]['text']
-                status.success(f"Success with {model_name}!")
-                st.text_area("Results:", text.replace("```", "").strip(), height=400)
-            else:
-                # Ha 404, kiírjuk a pontos választ a Google-től
-                st.error(f"Model {model_name} failed (Error {response.status_code})")
-                st.write("Google's reason:", response.json().get('error', {}).get('message'))
-                st.info("💡 Try selecting a different model variant from the sidebar!")
-                
         except Exception as e:
-            st.error(f"Fatal error: {str(e)}")
+            st.error(f"Error: {str(e)}")
 
 elif not api_key:
-    st.warning("API Key missing from Streamlit Secrets!")
+    st.warning("Add your OPENAI_API_KEY to Streamlit Secrets!")
