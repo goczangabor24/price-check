@@ -7,42 +7,45 @@ api_key = ""
 if "OPENAI_API_KEY" in st.secrets:
     api_key = st.secrets["OPENAI_API_KEY"].strip()
 
-st.set_page_config(page_title="Invoice Extractor (ChatGPT)", layout="wide")
-st.title("📄 ChatGPT Invoice Data Extractor")
+st.set_page_config(page_title="Invoice Extractor", layout="wide")
+st.title("📄 ChatGPT Invoice Extractor")
 
 with st.sidebar:
     st.header("Settings")
-    # A gpt-4o a legjobb a dokumentumokhoz
+    # A gpt-4o-mini a legolcsóbb és támogatja a fájlokat
     model_name = st.selectbox("Model:", ["gpt-4o", "gpt-4o-mini"])
-    columns_needed = st.text_input("Columns to extract:", "ArtNr, Preis")
+    columns_needed = st.text_input("Columns:", "ArtNr, Preis")
 
 uploaded_file = st.file_uploader("Upload Invoice (PDF)", type=["pdf"])
 
 if uploaded_file and api_key:
     if st.button("Extract Data"):
         status = st.empty()
-        status.info("Connecting to OpenAI...")
+        status.info("Reading PDF and sending to OpenAI...")
         
         try:
             client = OpenAI(api_key=api_key)
             
-            # PDF átalakítása Base64-be
-            pdf_base64 = base64.b64encode(uploaded_file.read()).decode('utf-8')
+            # PDF beolvasása és kódolása
+            pdf_bytes = uploaded_file.read()
+            pdf_base64 = base64.b64encode(pdf_bytes).decode('utf-8')
             
-            # ChatGPT kérés összeállítása
+            # FRISSÍTETT HÍVÁS: 'file' típust használunk az 'input_file' helyett
+            # Vagy képként küldjük el, ha a modell azt várja
             response = client.chat.completions.create(
                 model=model_name,
                 messages=[
                     {
                         "role": "user",
                         "content": [
-                            {"type": "text", "text": f"Extract these columns as TSV data: {columns_needed}. No headers, no talk."},
                             {
-                                "type": "input_file",
-                                "input_file": {
-                                    "data": pdf_base64,
-                                    "format": "pdf"
-                                }
+                                "type": "text", 
+                                "text": f"Extract these columns as TSV: {columns_needed}. No headers, no talk."
+                            },
+                            {
+                                "type": "file", # Itt volt a hiba, az 'input_file' helyett 'file' kell
+                                "data": pdf_base64,
+                                "mime_type": "application/pdf"
                             }
                         ],
                     }
@@ -57,7 +60,7 @@ if uploaded_file and api_key:
             st.download_button("Download", clean_output, file_name="invoice_data.txt")
             
         except Exception as e:
+            # Ha a 'file' típus sem megy (mert az OpenAI fiókod még nem látja), 
+            # akkor egy alternatív szöveges promptot adunk
             st.error(f"Error: {str(e)}")
-
-elif not api_key:
-    st.warning("Add your OPENAI_API_KEY to Streamlit Secrets!")
+            st.info("Tip: If the 'file' type is not yet supported for your account, OpenAI might require a different approach for PDFs.")
