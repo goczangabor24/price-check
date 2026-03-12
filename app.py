@@ -153,11 +153,13 @@ Full extracted PDF text:
 
 def extract_rows_with_openai(client: OpenAI, model: str, columns: List[str], include_filename: bool, filename: str, text: str, table_preview: str) -> List[Dict[str, str]]:
     prompt = build_prompt(columns, include_filename, filename, text, table_preview)
-    response = client.responses.create(
-        model=model,
-        input=prompt,
-        temperature=0,
-    )
+    response = client.chat.completions.create(
+    model="gpt-5-mini",
+    messages=[
+        {"role": "system", "content": "You extract structured data from invoices."},
+        {"role": "user", "content": prompt}
+    ]
+)
     raw = getattr(response, "output_text", "") or ""
     raw = raw.strip()
 
