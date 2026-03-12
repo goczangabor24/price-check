@@ -1,23 +1,20 @@
 import streamlit as st
-import google.generativeai as genai
+import requests
+import base64
 
-# 1. API Kulcs tisztítása
+# --- CONFIGURATION ---
 api_key = ""
 if "GOOGLE_API_KEY" in st.secrets:
     api_key = st.secrets["GOOGLE_API_KEY"].strip().strip('"').strip("'")
 
-if api_key:
-    genai.configure(api_key=api_key)
-
 st.set_page_config(page_title="Invoice Extractor", layout="wide")
-st.title("📄 Invoice Data Extractor")
+st.title("📄 Direct Invoice Data Extractor")
 
-# 2. Beállítások a szélen
 with st.sidebar:
     st.header("Settings")
-    # Ha a flash nem létezik, a pro-val biztosan menni fog
-    model_choice = st.selectbox("Model Version:", ["gemini-1.5-flash", "gemini-1.5-pro"])
-    columns_needed = st.text_input("Columns to extract:", "ArtNr, Preis")
+    # Két különböző végpontot is kipróbálhatunk
+    model_version = st.selectbox("Model:", ["gemini-1.5-flash", "gemini-1.5-pro"])
+    columns_needed = st.text_input("Columns:", "ArtNr, Preis")
     decimal_sep = st.selectbox("Decimal separator:", [",", "."])
 
 uploaded_file = st.file_uploader("Upload Invoice (PDF)", type=["pdf"])
@@ -25,47 +22,52 @@ uploaded_file = st.file_uploader("Upload Invoice (PDF)", type=["pdf"])
 if uploaded_file and api_key:
     if st.button("Extract Data"):
         status = st.empty()
-        status.info("Processing...")
+        status.info("Sending direct request to Google API...")
         
         try:
-            # Modell példányosítása
-            model = genai.GenerativeModel(model_name=model_choice)
+            # PDF átalakítása Base64 formátumba
+            pdf_base64 = base64.b64encode(uploaded_file.read()).decode('utf-8')
             
-            # Fájl beolvasása
-            pdf_bytes = uploaded_file.read()
+            # Közvetlen URL a Google API-hoz (v1 stabil verzió!)
+            url = f"https://generativelanguage.googleapis.com/v1/models/{model_version}:generateContent?key={api_key}"
             
-            # A kérés összeállítása (ez a legstabilabb formátum)
-            prompt = (
-                f"Extract these columns from the PDF: {columns_needed}. "
-                f"Use Tab-Separated Values (TSV) format. "
-                f"Use '{decimal_sep}' as decimal separator. "
-                "Return ONLY the raw data rows, no headers, no chat, no markdown blocks."
-            )
+            headers = {'Content-Type': 'application/json'}
             
-            # Küldés a Google-nek
-            response = model.generate_content([
-                {"mime_type": "application/pdf", "data": pdf_bytes},
-                prompt
-            ])
-            
-            if response.text:
-                status.success("Success!")
-                # Megszabadulunk a kódblokk jelektől ha a modell mégis betenné
-                result = response.text.replace("```tsv", "").replace("```", "").strip()
-                
-                st.subheader("Extracted Data")
-                st.text_area("Copy output:", result, height=400)
-                st.download_button("Download as TXT", result, file_name="invoice_data.txt")
-            else:
-                status.error("AI returned empty text.")
+            payload = {
+                "contents": [{
+                    "parts": [
+                        {"text": f"Extract these columns: {columns_needed}. Format: TSV. Decimal: '{decimal_sep}'. Only raw data rows, no headers."},
+                        {
+                            "inline_data": {
+                                "mime_type": "application/pdf",
+                                "data": pdf_base64
+                            }
+                        }
+                    ]
+                }],
+                "generationConfig": {
+                    "temperature": 0.1,
+                    "topP": 0.95,
+                }
+            }
 
+            response = requests.post(url, json=payload, headers=headers)
+            res_json = response.json()
+
+            if response.status_code == 200:
+                # Kinyerjük a szöveget a válaszból
+                raw_text = res_json['candidates'][0]['content']['parts'][0]['text']
+                status.success("Done!")
+                
+                clean_output = raw_text.replace("```tsv", "").replace("```", "").strip()
+                st.text_area("Extracted Results:", clean_output, height=400)
+                st.download_button("Download TSV", clean_output, file_name="data.txt")
+            else:
+                # Itt kiírjuk a pontos hibát, ha a Google nemet mond
+                st.error(f"API Error {response.status_code}: {res_json.get('error', {}).get('message', 'Unknown error')}")
+                
         except Exception as e:
-            # Ha 404 hiba jön, adjunk tanácsot a felhasználónak
-            err_msg = str(e)
-            st.error(f"Error: {err_msg}")
-            if "404" in err_msg:
-                st.warning("⚠️ The 'Flash' model is currently unavailable in your region or API version. "
-                           "Please select 'gemini-1.5-pro' in the sidebar and try again!")
+            st.error(f"System Error: {str(e)}")
 
 elif not api_key:
-    st.warning("Please add your GOOGLE_API_KEY to Streamlit Secrets!")
+    st.warning("Please set your GOOGLE_API_KEY in Streamlit Secrets!")
