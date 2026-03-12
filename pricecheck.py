@@ -1,24 +1,24 @@
 import streamlit as st
 import google.generativeai as genai
 
-# --- API KULCS TISZTÍTÁSA ÉS BETÖLTÉSE ---
-raw_key = ""
+# --- API KEY CLEANUP ---
+api_key = ""
 try:
     if "GOOGLE_API_KEY" in st.secrets:
-        raw_key = st.secrets["GOOGLE_API_KEY"]
-    else:
-        st.error("Missing API Key in Secrets!")
+        api_key = st.secrets["GOOGLE_API_KEY"].strip().strip('"').strip("'")
 except:
-    raw_key = "YOUR_LOCAL_KEY"
-
-# Eltávolítja az esetleges szóközöket vagy idézőjeleket, amik a hibát okozzák
-api_key = raw_key.strip().strip('"').strip("'")
+    api_key = "YOUR_LOCAL_KEY"
 
 if api_key:
     genai.configure(api_key=api_key)
 
 st.set_page_config(page_title="Invoice Extractor", layout="wide")
 st.title("📄 Universal Invoice Data Extractor")
+
+# --- MODELL BEÁLLÍTÁSA ---
+# Megpróbáljuk a legstabilabb módon betölteni
+def get_model():
+    return genai.GenerativeModel('gemini-1.5-flash')
 
 with st.sidebar:
     st.header("Settings")
@@ -29,37 +29,42 @@ uploaded_file = st.file_uploader("Upload Invoice (PDF)", type=["pdf"])
 
 if uploaded_file and api_key:
     if st.button("Extract Data"):
-        # Egy üres helyfoglaló a státuszüzeneteknek
         status = st.empty()
         status.info("Connecting to Google AI...")
         
         try:
-            model = genai.GenerativeModel('gemini-1.5-flash')
-            pdf_parts = [
-                {
-                    "mime_type": "application/pdf",
-                    "data": uploaded_file.getvalue()
-                }
-            ]
+            # Itt történik a változtatás: explicit hívás
+            model = get_model()
+            
+            # PDF adat előkészítése
+            file_data = uploaded_file.getvalue()
             
             prompt = f"""
-            Extract these columns: {columns_needed}.
-            Format: Tab-Separated Values (TSV). Use '{decimal_sep}' for decimals.
-            Return ONLY raw rows. No headers, no markdown blocks.
+            Analyze this invoice and extract: {columns_needed}.
+            Format: Tab-Separated Values (TSV).
+            Decimal separator: '{decimal_sep}'.
+            Return ONLY raw data rows. No markdown, no headers.
             """
             
             status.info("Analyzing document... (this can take 15-30 seconds)")
-            response = model.generate_content([prompt, pdf_parts[0]])
             
-            # Válasz megjelenítése
+            # A generálás folyamata
+            response = model.generate_content([
+                prompt,
+                {"mime_type": "application/pdf", "data": file_data}
+            ])
+            
             if response.text:
                 status.success("Done!")
-                clean_text = response.text.strip().replace("```", "").replace("tsv", "")
-                st.text_area("Results:", clean_text, height=400)
-                st.download_button("Download TSV", clean_text, file_name="invoice.txt")
+                # Kitakarítjuk a választ
+                clean_text = response.text.replace("```tsv", "").replace("```", "").strip()
+                st.text_area("Extracted Data:", clean_text, height=400)
+                st.download_button("Download Data", clean_text, file_name="invoice_data.txt")
             else:
                 status.error("AI returned empty result.")
                 
         except Exception as e:
-            status.error(f"API Error: {str(e)}")
-            st.warning("Tip: Check if your API key has leading/trailing spaces in Streamlit Secrets.")
+            # Ha még mindig 404, kiírjuk a részleteket
+            st.error(f"Error: {str(e)}")
+            if "404" in str(e):
+                st.warning("The model name might have changed. Try 'gemini-1.5-pro' in the code if 'flash' fails.")
