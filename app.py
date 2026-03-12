@@ -49,11 +49,28 @@ def looks_numeric_column(column_name: str) -> bool:
         "net",
         "gross",
         "number",
+        "preis",
+        "betrag",
+        "menge",
+        "anzahl",
+        "einzelpreis",
+        "unit",
     ]
     return any(keyword in name for keyword in numeric_keywords)
 
 
 def normalize_european_number(value: str) -> str:
+    """
+    Converts numeric-looking values to European decimal style:
+    - decimal point becomes comma
+    - thousand separators are removed when identifiable
+
+    Examples:
+    12.50 -> 12,50
+    1,234.50 -> 1234,50
+    1.234,50 -> 1234,50
+    €8.9 -> 8,9
+    """
     if value is None:
         return ""
 
@@ -61,52 +78,59 @@ def normalize_european_number(value: str) -> str:
     if not s:
         return ""
 
-    s = s.replace("\u00a0", " ").strip()
+    s = s.replace("\u00a0", " ")
     s = re.sub(r"\bEUR\b", "", s, flags=re.IGNORECASE)
     s = s.replace("€", "").strip()
-
-    if not re.search(r"\d", s):
-        return s
-
     s = s.replace(" ", "")
 
+    # Keep only digits, separators and minus
+    s = re.sub(r"[^0-9,.\-]", "", s)
+
+    if not s or not re.search(r"\d", s):
+        return ""
+
+    # Case: both comma and dot موجود
     if "," in s and "." in s:
+        # 1.234,56 -> European input already, remove thousand dots
         if s.rfind(",") > s.rfind("."):
             s = s.replace(".", "")
-            s = s.replace(",", ".")
+            # keep decimal comma as final output
+            return s
+        # 1,234.56 -> US input, remove thousand commas and convert decimal dot
         else:
             s = s.replace(",", "")
-    elif "," in s:
+            s = s.replace(".", ",")
+            return s
+
+    # Case: only comma
+    if "," in s:
         parts = s.split(",")
         if len(parts) == 2 and len(parts[1]) in (1, 2, 3):
-            s = s.replace(",", ".")
-        else:
-            s = s.replace(",", "")
-    elif "." in s:
+            # treat as decimal comma already
+            return s
+        # otherwise probably thousand separators
+        return s.replace(",", "")
+
+    # Case: only dot
+    if "." in s:
         parts = s.split(".")
+        if len(parts) == 2 and len(parts[1]) in (1, 2, 3):
+            return s.replace(".", ",")
         if len(parts) > 2:
             decimal_part = parts[-1]
             int_part = "".join(parts[:-1])
             if len(decimal_part) in (1, 2, 3):
-                s = f"{int_part}.{decimal_part}"
-            else:
-                s = "".join(parts)
+                return f"{int_part},{decimal_part}"
+            return "".join(parts)
 
-    try:
-        num = float(s)
-        if num.is_integer():
-            return str(int(num))
-        formatted = f"{num:.2f}".rstrip("0").rstrip(".")
-        return formatted.replace(".", ",")
-    except Exception:
-        return str(value).strip()
+    return s
 
 
 def sanitize_cell(value: str, numeric: bool) -> str:
     if value is None:
         return ""
-    text = str(value).strip()
 
+    text = str(value).strip()
     if not text:
         return ""
 
@@ -153,7 +177,11 @@ def extract_text_and_tables_from_pdf(file_bytes: bytes) -> Tuple[str, str]:
     return "\n".join(all_text), "\n".join(all_tables)
 
 
-def render_pdf_pages_to_base64_png(file_bytes: bytes, max_pages: int = 8, zoom: float = 2.0) -> List[str]:
+def render_pdf_pages_to_base64_png(
+    file_bytes: bytes,
+    max_pages: int = 8,
+    zoom: float = 2.0
+) -> List[str]:
     doc = fitz.open(stream=file_bytes, filetype="pdf")
     images_base64 = []
 
@@ -383,7 +411,12 @@ with st.sidebar:
     api_key = get_api_key()
     model = st.text_input("Model", value="gpt-4.1-mini")
     include_filename = st.checkbox("Include source filename column", value=True)
-    max_pages = st.number_input("Max pages for scanned PDF fallback", min_value=1, max_value=20, value=8)
+    max_pages = st.number_input(
+        "Max pages for scanned PDF fallback",
+        min_value=1,
+        max_value=20,
+        value=8
+    )
 
 st.markdown("### 1. Upload PDF files")
 uploaded_files = st.file_uploader(
@@ -395,8 +428,9 @@ uploaded_files = st.file_uploader(
 st.markdown("### 2. Enter the columns to extract")
 columns_input = st.text_area(
     "One column per line",
-    value="item code\nunit price w/o VAT",
+    value="",
     height=120,
+    placeholder="Example:\nitem code\nunit price w/o VAT",
 )
 
 run = st.button("Extract data", type="primary")
@@ -438,8 +472,14 @@ if run:
                     table_preview=table_preview,
                 )
             else:
-                st.info(f"{uploaded_file.name}: No readable text layer found. Switching to image-based extraction.")
-                images_base64 = render_pdf_pages_to_base64_png(file_bytes, max_pages=max_pages)
+                st.info(
+                    f"{uploaded_file.name}: No readable text layer found. "
+                    "Switching to image-based extraction."
+                )
+                images_base64 = render_pdf_pages_to_base64_png(
+                    file_bytes,
+                    max_pages=max_pages
+                )
 
                 rows = extract_rows_from_images_with_openai(
                     client=client,
@@ -451,7 +491,9 @@ if run:
                 )
 
             if not rows:
-                st.warning(f"{uploaded_file.name}: No rows could be extracted for the requested columns.")
+                st.warning(
+                    f"{uploaded_file.name}: No rows could be extracted for the requested columns."
+                )
             else:
                 all_rows.extend(rows)
                 st.success(f"{uploaded_file.name}: Extracted {len(rows)} row(s).")
