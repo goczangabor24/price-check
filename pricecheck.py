@@ -1,6 +1,6 @@
 import streamlit as st
 import google.generativeai as genai
-import pandas as pd
+import time
 
 # --- CONFIGURATION ---
 try:
@@ -17,47 +17,56 @@ with st.sidebar:
     st.header("Settings")
     columns_needed = st.text_input("Columns to extract:", "ArtNr, Preis")
     decimal_sep = st.selectbox("Decimal separator:", [",", "."])
+    show_debug = st.checkbox("Show technical details (Debug)")
 
 uploaded_file = st.file_uploader("Upload Invoice (PDF)", type=["pdf"])
 
 if uploaded_file:
     if st.button("Extract Data"):
-        with st.spinner("Processing... please wait."):
-            try:
-                model = genai.GenerativeModel('gemini-1.5-flash')
-                pdf_data = uploaded_file.read()
-                
-                # Szigorúbb utasítás a modellnek
-                prompt = f"""
-                Analyze the uploaded invoice and extract these columns: {columns_needed}.
-                
-                Output Format:
-                - Use Tab-Separated Values (TSV).
-                - Use '{decimal_sep}' for decimals.
-                - Provide ONLY the raw data rows.
-                - NO headers, NO markdown code blocks (no backticks), NO talking.
-                """
-                
-                response = model.generate_content([
-                    prompt,
-                    {"mime_type": "application/pdf", "data": pdf_data}
-                ])
-                
-                # Tisztítjuk a választ (levágjuk a felesleges szóközöket/jeleket)
-                result_text = response.text.strip().replace("```", "").replace("tsv", "")
+        status_container = st.empty()
+        status_container.info("Initializing Gemini AI...")
+        
+        try:
+            model = genai.GenerativeModel('gemini-1.5-flash')
+            pdf_data = uploaded_file.read()
+            
+            prompt = f"""
+            Analyze the uploaded invoice and extract these columns: {columns_needed}.
+            Format: Tab-Separated Values (TSV). Use '{decimal_sep}' for decimals.
+            Provide ONLY raw data rows, no headers, no conversational text.
+            """
+            
+            status_container.info("Sending file to Google servers... (this may take 10-20 seconds)")
+            
+            # Időmérés a biztonság kedvéért
+            start_time = time.time()
+            
+            response = model.generate_content([
+                prompt,
+                {"mime_type": "application/pdf", "data": pdf_data}
+            ])
+            
+            end_time = time.time()
+            
+            if show_debug:
+                st.write(f"Response time: {end_time - start_time:.2f} seconds")
 
-                if result_text:
-                    st.subheader("Extracted Results")
-                    # Megjelenítés táblázatként (ha lehetséges)
-                    st.text_area("Raw Data (Copyable):", result_text, height=250)
-                    
-                    st.download_button(
-                        label="Download Data",
-                        data=result_text,
-                        file_name="invoice_data.txt"
-                    )
-                else:
-                    st.error("The model returned an empty response. Try changing the column names.")
-                    
-            except Exception as e:
-                st.error(f"Critical Error: {str(e)}")
+            # Válasz tisztítása
+            result_text = response.text.strip().replace("```", "").replace("tsv", "")
+
+            if result_text:
+                status_container.success("Extraction complete!")
+                st.subheader("Extracted Results")
+                st.text_area("Raw Data (Copyable):", result_text, height=300)
+                
+                st.download_button(
+                    label="Download Results",
+                    data=result_text,
+                    file_name="invoice_data.txt"
+                )
+            else:
+                status_container.error("The AI returned an empty response. Try more specific column names.")
+                
+        except Exception as e:
+            status_container.error(f"An error occurred during processing.")
+            st.exception(e) # Ez kiírja a pontos hibaüzenetet
